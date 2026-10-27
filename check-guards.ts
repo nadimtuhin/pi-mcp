@@ -14,7 +14,7 @@ const cases = [
   ['service.ts', 'tokens: await this.tokens(id)', 'tokens: null', 'sqlite usage'],
   ['service.ts', "tokens: await this.tokens(id)", "tokens: { prompt: 0, completion: 0 }", 'models survive'],
   ['service.ts', "result.state = 'dead'", "result.state = 'running'", 'gone wrapper'],
-  ['service.ts', 'process.kill(-run.pid, \'SIGTERM\')', 'process.kill(run.pid, \'SIGTERM\')', 'detached run'],
+  ['service.ts', 'kill(-run.pid, \'SIGTERM\')', 'kill(run.pid, \'SIGTERM\')', 'detached run'],
   ['service.ts', 'return this.call(\'pi_start\', run)', "return { error: 'disabled' }", 'detached run'],
   ['worker.ts', 'policy = true; rc = 3;', 'policy = false; rc = 0;', 'unreadable policy'],
   ['worker.ts', 'rc === 4 ? \'quota\'', 'false ? \'quota\'', 'quota log'],
@@ -44,6 +44,8 @@ const cases = [
   ['worker.ts', "outcome === 'quota' ? last(/retry", "false ? last(/retry", 'quota run records retry-after'],
   ['worker.ts', "outcome === 'quota' ? last(/reset", "false ? last(/reset", 'quota run records absolute'],
   ['worker.ts', "if (signal === 'SIGTERM') killed = true;", '', 'terminated by a signal'],
+  ['service.ts', ".catch(error => { if (alive(child.pid!)) throw error; return ''; })", '', 'start tolerates a process that exits'],
+  ['service.ts', " && error.code !== 'EPERM') throw error; return true;", ") throw error; return true;", 'EPERM on a dead process group'],
   ['index.ts', 'pending.push(handle(line));', 'await handle(line);', 'a slow tool call'],
 ];
 let failed = 0;

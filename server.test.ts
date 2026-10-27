@@ -1,7 +1,7 @@
 import { test, expect, afterEach } from 'bun:test';
 import { mkdirSync, rmSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { Service } from './service';
+import { Service, alive } from './service';
 import { Database } from 'bun:sqlite';
 
 const roots: string[] = [];
@@ -361,4 +361,28 @@ test('pid file pointing at an unrelated live process is not adopted or signalled
     await expect(service.call('pi_stop', { session: 'alien' })).rejects.toThrow('unsafe pid');
     expect(process.kill(stranger.pid, 0)).toBe(true);
   } finally { stranger.kill(); await stranger.exited; }
+});
+
+test('start tolerates a process that exits before its start time can be read', async () => {
+  const gone = async (pid: number) => { while (alive(pid)) await Bun.sleep(5); throw new Error('process identity unavailable'); };
+  const { service, http, args } = await startable({ identity: gone });
+  service.config.durable = ['/usr/bin/true'];
+  try {
+    expect(await service.call('pi_start', args('quick'))).toMatchObject({ rc: 0 });
+  } finally { http.stop(true); }
+});
+
+test('stop treats EPERM on a dead process group as gone', async () => {
+  const kill = (pid: number, signal: any) => {
+    if (pid < 0 && signal === 0) throw Object.assign(new Error('EPERM'), { code: 'EPERM' });
+    process.kill(pid, signal);
+  };
+  const { root, service, http, args } = await startable({ kill, stopGraceMs: 150 });
+  service.config.durable = slowDurable(root);
+  let pid: number | undefined;
+  try {
+    pid = (await service.call('pi_start', args('zombie'))).pid;
+    await Bun.sleep(200);
+    expect(await service.call('pi_stop', { session: 'zombie' })).toMatchObject({ stopped: true });
+  } finally { killGroup(pid); http.stop(true); }
 });

@@ -3,7 +3,8 @@ import { spawn } from 'node:child_process';
 import { resolve } from 'node:path';
 
 export type Config = { root: string; status?: string[]; modelsUrl?: string; headroom?: string[]; fallback?: string[]; durable?: string[]; policy?: string; db?: string;
-  stopGraceMs?: number; lockWaitMs?: number; lockStaleMs?: number; launchGraceMs?: number; afterSpawn?: () => void };
+  stopGraceMs?: number; lockWaitMs?: number; lockStaleMs?: number; launchGraceMs?: number; afterSpawn?: () => void;
+  identity?: (pid: number) => Promise<string>; kill?: (pid: number, signal: NodeJS.Signals | 0) => void };
 const poolOf = (model: string) => model.split('/')[0];
 function jsonFile(path: string, fallback: any): any {
   try { return JSON.parse(readFileSync(path, 'utf8')); }
@@ -195,15 +196,16 @@ export class Service {
       if (!run) throw new Error('unknown session');
       if (name === 'pi_resume') return this.call('pi_start', run);
       if (run.pid === process.pid || !Number.isInteger(run.pid) || run.pid <= 1) throw new Error('unsafe pid');
-      const current = alive(run.pid) ? await identity(run.pid).catch(() => null) : null;
+      const kill = this.config.kill ?? ((pid: number, signal: NodeJS.Signals | 0) => process.kill(pid, signal));
+      const current = alive(run.pid) ? await (this.config.identity ?? identity)(run.pid).catch(() => null) : null;
       if (current !== null || alive(run.pid)) {
         if (!run.identity || current !== run.identity) throw new Error('stale process identity');
-        process.kill(-run.pid, 'SIGTERM');
+        kill(-run.pid, 'SIGTERM');
         const deadline = Date.now() + (this.config.stopGraceMs ?? 3000);
         while (alive(run.pid) && Date.now() < deadline) await Bun.sleep(20);
-        try { process.kill(-run.pid, 'SIGKILL'); } catch (error: any) { if (error.code !== 'ESRCH') throw error; }
+        try { kill(-run.pid, 'SIGKILL'); } catch (error: any) { if (error.code !== 'ESRCH') throw error; }
       }
-      const groupGone = () => { try { process.kill(-run.pid, 0); return false; } catch (error: any) { if (error.code !== 'ESRCH' && error.code !== 'EPERM') throw error; return true; } };
+      const groupGone = () => { try { kill(-run.pid, 0); return false; } catch (error: any) { if (error.code !== 'ESRCH' && error.code !== 'EPERM') throw error; return true; } };
       const groupDeadline = Date.now() + 1000;
       while (!groupGone() && Date.now() < groupDeadline) await Bun.sleep(10);
       if (!groupGone()) throw new Error('process group remains');
@@ -255,7 +257,7 @@ export class Service {
         child.unref();
         this.config.afterSpawn?.();
         const registered = this.runs().find(row => row.session === args.session);
-        this.saveRuns([...others, { ...registered, pid: child.pid, identity: await identity(child.pid!).catch(error => { if (alive(child.pid!)) throw error; return ''; }), launching: false }]);
+        this.saveRuns([...others, { ...registered, pid: child.pid, identity: await (this.config.identity ?? identity)(child.pid!).catch(error => { if (alive(child.pid!)) throw error; return ''; }), launching: false }]);
         const warnings: string[] = [];
         if (['LOW', 'EXHAUSTED'].includes(target.status)) warnings.push(`pool ${target.status}`);
         if (target.success_pct !== null && 100 - target.success_pct > 30) warnings.push('7-day failure rate exceeds 30%');
