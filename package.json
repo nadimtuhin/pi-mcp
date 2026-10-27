@@ -1,0 +1,12 @@
+{
+  "name": "pi-mcp",
+  "version": "0.1.0",
+  "description": "MCP server that starts, monitors, stops and resumes detached pi agent runs with per-pool rate limits",
+  "license": "MIT",
+  "type": "module",
+  "main": "index.ts",
+  "scripts": {
+    "test": "bun test server.test.ts && bun test protocol.test.ts && bun test durable.test.ts",
+    "check-guards": "bun check-guards.ts"
+  }
+}
