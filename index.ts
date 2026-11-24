@@ -32,11 +32,11 @@ async function dispatch(request: any) {
   else if (request.method === 'tools/list') result = { tools: Object.entries(definitions).map(([name, definition]) => ({ name, description: definition.description, inputSchema: { type: 'object', properties: definition.properties, required: definition.required, additionalProperties: false } })) };
   else if (request.method === 'tools/call') {
     const name = request.params?.name;
-    const definition = definitions[name];
+    const definition = typeof name === 'string' && Object.hasOwn(definitions, name) ? definitions[name] : undefined;
     if (!definition) return error(-32602, 'Unknown tool');
     const args = request.params.arguments ?? {};
     try {
-      if (!args || typeof args !== 'object' || Array.isArray(args) || Object.keys(args).some(key => !definition.properties[key]) || definition.required.some(key => args[key] === undefined) || Object.entries(args).some(([key, value]) => typeof value !== definition.properties[key].type)) throw new Error('invalid arguments');
+      if (!args || typeof args !== 'object' || Array.isArray(args) || Object.keys(args).some(key => !Object.hasOwn(definition.properties, key)) || definition.required.some(key => args[key] === undefined) || Object.entries(args).some(([key, value]) => typeof value !== definition.properties[key].type)) throw new Error('invalid arguments');
       const value = await service.call(name, args);
       result = { content: [{ type: 'text', text: JSON.stringify(value) }], ...(value?.error ? { isError: true } : {}) };
     } catch (error: any) { result = { content: [{ type: 'text', text: error.message }], isError: true }; }

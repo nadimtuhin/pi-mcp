@@ -1,7 +1,7 @@
 import { test, expect, afterEach } from 'bun:test';
 import { mkdirSync, rmSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { Service, alive } from './service';
+import { Service, alive, capture } from './service';
 import { Database } from 'bun:sqlite';
 
 const roots: string[] = [];
@@ -87,7 +87,7 @@ test('detached run survives service restart; stop kills children; resume keeps s
     expect((await restarted.call('pi_history'))[0].last_failure_reason).toBe('killed');
     expect(historyRows(root)[0].reconciled).toBeUndefined();
     expect(existsSync(`${root}/termed`)).toBe(true);
-    expect(() => process.kill(child, 0)).toThrow();
+    expect(running(child)).toBe(false);
     writeFileSync(`${root}/continue`, 'yes');
     const resumed = await restarted.call('pi_resume', { session: 'stable' });
     pid = resumed.pid;
@@ -96,6 +96,12 @@ test('detached run survives service restart; stop kills children; resume keeps s
     expect((await restarted.call('pi_list')).recent.every((row: any) => row.session === 'stable')).toBe(true);
   } finally { if (pid) { try { process.kill(-pid, 'SIGKILL'); } catch {} } http.stop(true); }
 });
+// A reaped process and a zombie awaiting a slow init are both not running.
+function running(pid: number) {
+  try { process.kill(pid, 0); } catch { return false; }
+  const stat = Bun.spawnSync(['ps', '-o', 'stat=', '-p', String(pid)]).stdout.toString().trim();
+  return stat !== '' && !stat.startsWith('Z');
+}
 async function until(check: () => any) {
   const deadline = Date.now() + 4000;
   while (!await check()) {
@@ -385,4 +391,85 @@ test('stop treats EPERM on a dead process group as gone', async () => {
     await Bun.sleep(200);
     expect(await service.call('pi_stop', { session: 'zombie' })).toMatchObject({ stopped: true });
   } finally { killGroup(pid); http.stop(true); }
+});
+
+test('stop treats a process group whose only members are zombies as gone', async () => {
+  // Orphaned children are reparented to init; under a slow-reaping init (containers) they linger as zombies,
+  // so signal 0 to the group still succeeds even though nothing is running.
+  const kill = (pid: number, signal: any) => { if (pid < 0 && signal === 0) return; process.kill(pid, signal); };
+  const { root, service, http, args } = await startable({ kill, stopGraceMs: 150 });
+  service.config.durable = slowDurable(root);
+  let pid: number | undefined;
+  try {
+    pid = (await service.call('pi_start', args('reaped'))).pid;
+    await Bun.sleep(200);
+    expect(await service.call('pi_stop', { session: 'reaped' })).toMatchObject({ stopped: true });
+  } finally { killGroup(pid); http.stop(true); }
+});
+
+test('hanging status script is bounded by a timeout', async () => {
+  const { root, service } = fixture({ scriptTimeoutMs: 300 });
+  writeFileSync(`${root}/hang.sh`, '#!/bin/sh\nexec sleep 30\n', { mode: 0o700 });
+  service.config.status = [`${root}/hang.sh`];
+  writeFileSync(`${root}/x.log`, '1\n');
+  const started = Date.now();
+  await expect(service.call('pi_status', { log: `${root}/x.log` })).rejects.toThrow('status script failed');
+  expect(Date.now() - started).toBeLessThan(3000);
+});
+
+test('hanging headroom script does not hang pi_models', async () => {
+  const http = Bun.serve({ port: 0, hostname: '127.0.0.1', fetch: () => Response.json({ data: [{ id: 'cx/test' }] }) });
+  try {
+    const { service } = fixture({ scriptTimeoutMs: 300, modelsUrl: `http://127.0.0.1:${http.port}/v1/models`, headroom: ['/bin/sleep', '30'] });
+    const started = Date.now();
+    expect((await service.call('pi_models'))[0]).toMatchObject({ model: 'cx/test', status: 'UNKNOWN' });
+    expect(Date.now() - started).toBeLessThan(3000);
+  } finally { http.stop(true); }
+});
+
+test('status log path is passed to the script as an absolute path, never as an option', async () => {
+  const { root, service } = fixture();
+  writeFileSync(`${root}/argv.sh`, `#!/bin/sh\nprintf '%s' "$1" > "${root}/argv"\necho '{"state":"running","turns":0,"tools":0,"retries":0}'\n`, { mode: 0o700 });
+  service.config.status = [`${root}/argv.sh`];
+  await service.call('pi_status', { log: '--help' }).catch(() => {});
+  expect(readFileSync(`${root}/argv`, 'utf8')).toBe(resolve('--help'));
+});
+
+test('status script whose grandchild holds stdout open still frees the pool slot on timeout', async () => {
+  const { root, service, http, args } = await startable();
+  service.config.durable = ['/usr/bin/true'];
+  service.config.scriptTimeoutMs = 300;
+  writeFileSync(`${root}/hold.sh`, `#!/bin/sh\nsleep 30 &\necho $! > "${root}/grandchild"\nexec sleep 30\n`, { mode: 0o700 });
+  service.config.status = [`${root}/hold.sh`];
+  let pid: number | undefined;
+  try {
+    pid = (await service.call('pi_start', args('held'))).pid;
+    await until(() => historyRows(root).length === 1);
+    await until(() => !running(pid!));
+    await until(async () => (await service.poolState('cx')).in_flight === 0);
+    await until(() => !running(Number(readFileSync(`${root}/grandchild`, 'utf8'))));
+  } finally { if (pid) { try { process.kill(-pid, 'SIGKILL'); } catch {} } http.stop(true); }
+});
+
+test('capture timeout kills the whole process group and does not wait on an inherited pipe', async () => {
+  const { root } = fixture();
+  writeFileSync(`${root}/hold.sh`, `#!/bin/sh\nsleep 30 &\necho $! > "${root}/grandchild"\nexec sleep 30\n`, { mode: 0o700 });
+  const started = Date.now();
+  expect(await capture([`${root}/hold.sh`], 300)).toEqual({ code: null, stdout: '' });
+  expect(Date.now() - started).toBeLessThan(3000);
+  await until(() => !running(Number(readFileSync(`${root}/grandchild`, 'utf8'))));
+});
+
+test('capture timeout releases its caller even when a grandchild escaped the process group with the pipe', async () => {
+  const { root } = fixture();
+  writeFileSync(`${root}/escape.sh`, `#!/bin/sh\nsetsid sleep 30 &\necho $! > "${root}/escaped"\nexec sleep 30\n`, { mode: 0o700 });
+  const caller = Bun.spawn([process.execPath, '-e', `const { capture } = await import(${JSON.stringify(resolve('service.ts'))}); await capture([${JSON.stringify(`${root}/escape.sh`)}], 300);`], { stdout: 'ignore', stderr: 'ignore' });
+  try {
+    const started = Date.now();
+    await until(async () => caller.exitCode !== null);
+    expect(Date.now() - started).toBeLessThan(3000);
+  } finally {
+    caller.kill('SIGKILL');
+    try { process.kill(Number(readFileSync(`${root}/escaped`, 'utf8')), 'SIGKILL'); } catch {}
+  }
 });

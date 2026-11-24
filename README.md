@@ -54,4 +54,4 @@ The 6 tests in `durable.test.ts` exercise the real scripts and are skipped when 
 
 - One history row per durable invocation, not per internal attempt.
 - PID reuse risk is reduced but not eliminated.
-- Script subprocesses have no execution or output bounds.
+- Helper scripts (status, headroom, sqlite3) are killed after 30 s; their output size is not bounded.

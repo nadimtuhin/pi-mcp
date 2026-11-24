@@ -1,7 +1,7 @@
 import { readFileSync, writeFileSync } from 'node:fs';
 
 const cases = [
-  ['service.ts', "const child = Bun.spawn([...(this.config.status ?? ['pi-status.sh']), log]", "const child = Bun.spawn(['/usr/bin/false', log]", 'status delegates'],
+  ['service.ts', "await capture([...(this.config.status ?? ['pi-status.sh']), log]", "await capture(['/usr/bin/false', log]", 'status delegates'],
   ['service.ts', 'hits++;', 'hits = 1;', 'two quotas'],
   ['service.ts', 'hits = 0; cooldown = null;', 'hits = 0;', 'two quotas'],
   ['service.ts', 'row.concurrency - 1', 'row.concurrency', 'quota concurrency'],
@@ -47,6 +47,13 @@ const cases = [
   ['service.ts', ".catch(error => { if (alive(child.pid!)) throw error; return ''; })", '', 'start tolerates a process that exits'],
   ['service.ts', " && error.code !== 'EPERM') throw error; return true;", ") throw error; return true;", 'EPERM on a dead process group'],
   ['index.ts', 'pending.push(handle(line));', 'await handle(line);', 'a slow tool call'],
+  ['index.ts', "Object.hasOwn(definitions, name) ? definitions[name] : undefined", 'definitions[name]', 'inherited from Object.prototype'],
+  ['service.ts', 'return !await groupRunning(run.pid);', 'return false;', 'only members are zombies'],
+  ['service.ts', "resolve('expired'), timeoutMs)", "resolve('expired'), 1e9)", 'hanging'],
+  ['service.ts', "detached: true, stdio: ['ignore', 'pipe', 'ignore']", "stdio: ['ignore', 'pipe', 'ignore']", 'capture timeout kills the whole process group'],
+  ['service.ts', '    stdout.destroy();\n', '', 'escaped the process group'],
+  ['worker.ts', 'run.log], run.scriptTimeoutMs)', 'run.log])', 'grandchild holds stdout open'],
+  ['service.ts', "!args.log.includes('\\0') ? resolve(args.log) : args.log", "!args.log.includes('\\0') ? args.log : args.log", 'absolute path, never as an option'],
 ];
 let failed = 0;
 for (const [file, before, after, filter, suite] of cases) {

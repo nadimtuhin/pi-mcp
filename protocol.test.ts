@@ -38,3 +38,14 @@ test('a slow tool call does not block later requests', async () => {
     expect(ids).toEqual([2, 1]);
   } finally { await proc.exited; rmSync(dir, { recursive: true, force: true }); }
 });
+
+test('tool names inherited from Object.prototype are unknown tools', async () => {
+  const proc = Bun.spawn([process.execPath, 'index.ts'], { stdin: 'pipe', stdout: 'pipe', stderr: 'pipe', env: { PATH: process.env.PATH, PI_RUN_ROOT: `${import.meta.dir}/.protocol-proto` } });
+  try {
+    proc.stdin.write(['toString', 'constructor', '__proto__'].map((name, i) => JSON.stringify({ jsonrpc: '2.0', id: i + 1, method: 'tools/call', params: { name, arguments: {} } })).join('\n') + '\n');
+    proc.stdin.end();
+    const replies = (await new Response(proc.stdout).text()).trim().split('\n').map(line => JSON.parse(line));
+    expect(replies.length).toBe(3);
+    for (const reply of replies) expect(reply.error).toMatchObject({ code: -32602, message: 'Unknown tool' });
+  } finally { await proc.exited; rmSync(`${import.meta.dir}/.protocol-proto`, { recursive: true, force: true }); }
+});
