@@ -3,7 +3,7 @@ import { spawn } from 'node:child_process';
 import { resolve } from 'node:path';
 
 export type Config = { root: string; status?: string[]; modelsUrl?: string; headroom?: string[]; fallback?: string[]; durable?: string[]; policy?: string; db?: string;
-  stopGraceMs?: number; lockWaitMs?: number; lockStaleMs?: number; launchGraceMs?: number; afterSpawn?: () => void;
+  stopGraceMs?: number; scriptTimeoutMs?: number; lockWaitMs?: number; lockStaleMs?: number; launchGraceMs?: number; afterSpawn?: () => void;
   identity?: (pid: number) => Promise<string>; kill?: (pid: number, signal: NodeJS.Signals | 0) => void };
 const poolOf = (model: string) => model.split('/')[0];
 function jsonFile(path: string, fallback: any): any {
@@ -41,6 +41,24 @@ export function summarize(rows: any[], now = Date.now()): any[] {
       last_failure_reason: failures.at(-1)?.outcome ?? null,
       cooldown_until: cooldown && cooldown > now ? cooldown : null };
   });
+}
+// Runs a helper script with a hard deadline. The child is SIGKILLed on expiry and the read is abandoned, so a
+// grandchild that keeps the pipe open cannot stall the caller either. code is null when the deadline passed.
+export async function capture(command: string[], timeoutMs = 30_000): Promise<{ code: number | null; stdout: string }> {
+  const child = Bun.spawn(command, { stdout: 'pipe', stderr: 'ignore' });
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expired = new Promise<null>(resolve => { timer = setTimeout(() => { child.kill('SIGKILL'); resolve(null); }, timeoutMs); });
+  try {
+    const done = await Promise.race([Promise.all([new Response(child.stdout).text(), child.exited]), expired]);
+    return done ? { code: done[1], stdout: done[0] } : { code: null, stdout: '' };
+  } finally { clearTimeout(timer); }
+}
+// True while the process group has a member that is not a zombie. Orphans reparented to a slow-reaping init
+// (common in containers) stay visible to kill(-pgid, 0) as zombies after everything has exited.
+async function groupRunning(pgid: number): Promise<boolean> {
+  const { code, stdout } = await capture(['ps', '-A', '-o', 'pgid=,stat='], 5000);
+  if (code !== 0) return true;
+  return stdout.split('\n').some(line => { const [group, stat] = line.trim().split(/\s+/); return Number(group) === pgid && !!stat && !stat.startsWith('Z'); });
 }
 export function alive(pid: number): boolean {
   if (!Number.isInteger(pid) || pid <= 1) return false;
@@ -157,10 +175,9 @@ export class Service {
     const ranges = windows.map(row => `(julianday(timestamp) >= julianday(${quote(new Date(time(row.ts_start)).toISOString())}) AND julianday(timestamp) <= julianday(${quote(new Date(time(row.ts_end)).toISOString())}))`).join(' OR ');
     try {
       accessSync(this.config.db, constants.R_OK);
-      const child = Bun.spawn(['sqlite3', '-readonly', '-json', this.config.db, `SELECT coalesce(sum(promptTokens),0) AS prompt, coalesce(sum(completionTokens),0) AS completion FROM usageHistory WHERE model = ${quote(model)} AND (${ranges})`], { stdout: 'pipe', stderr: 'ignore' });
-      const output = await new Response(child.stdout).text();
-      if (await child.exited !== 0) return null;
-      return JSON.parse(output)[0] ?? null;
+      const { code, stdout } = await capture(['sqlite3', '-readonly', '-json', this.config.db, `SELECT coalesce(sum(promptTokens),0) AS prompt, coalesce(sum(completionTokens),0) AS completion FROM usageHistory WHERE model = ${quote(model)} AND (${ranges})`], this.config.scriptTimeoutMs);
+      if (code !== 0) return null;
+      return JSON.parse(stdout)[0] ?? null;
     } catch { return null; }
   }
   async models() {
@@ -170,10 +187,9 @@ export class Service {
     if (!Array.isArray(catalog.data) || catalog.data.some((row: any) => typeof row.id !== 'string')) throw new Error('invalid model catalog');
     let headroom: any[] = [];
     try {
-      const command = Bun.spawn(this.config.headroom ?? ['model-headroom', '--json'], { stdout: 'pipe', stderr: 'ignore' });
-      const output = await new Response(command.stdout).text();
-      if (await command.exited === 0) {
-        const parsed = JSON.parse(output);
+      const { code, stdout } = await capture(this.config.headroom ?? ['model-headroom', '--json'], this.config.scriptTimeoutMs);
+      if (code === 0) {
+        const parsed = JSON.parse(stdout);
         headroom = Array.isArray(parsed) ? parsed : parsed.pools;
         if (!Array.isArray(headroom)) throw new Error('invalid headroom');
       }
@@ -205,10 +221,13 @@ export class Service {
         while (alive(run.pid) && Date.now() < deadline) await Bun.sleep(20);
         try { kill(-run.pid, 'SIGKILL'); } catch (error: any) { if (error.code !== 'ESRCH') throw error; }
       }
-      const groupGone = () => { try { kill(-run.pid, 0); return false; } catch (error: any) { if (error.code !== 'ESRCH' && error.code !== 'EPERM') throw error; return true; } };
+      const groupGone = async () => {
+        try { kill(-run.pid, 0); } catch (error: any) { if (error.code !== 'ESRCH' && error.code !== 'EPERM') throw error; return true; }
+        return !await groupRunning(run.pid);
+      };
       const groupDeadline = Date.now() + 1000;
-      while (!groupGone() && Date.now() < groupDeadline) await Bun.sleep(10);
-      if (!groupGone()) throw new Error('process group remains');
+      while (!await groupGone() && Date.now() < groupDeadline) await Bun.sleep(20);
+      if (!await groupGone()) throw new Error('process group remains');
       const recorded = () => readHistory(this.config.root).some(row => row.session === run.session && row.attempt === run.attempt && row.outcome === 'killed');
       const historyDeadline = Date.now() + 300;
       while (!recorded() && Date.now() < historyDeadline) await Bun.sleep(10);
@@ -284,13 +303,14 @@ export class Service {
     }
     if (name === 'pi_status') {
       await this.reconcile();
-      const run = this.runs().find(row => args.session ? row.session === args.session : row.log === args.log);
-      const log = args.log ?? run?.log;
+      // Absolute, so a log argument such as "--help" can never be read as an option by the status script.
+      const requested = typeof args.log === 'string' && args.log && !args.log.includes('\0') ? resolve(args.log) : args.log;
+      const run = this.runs().find(row => args.session ? row.session === args.session : row.log === requested);
+      const log = requested ?? run?.log;
       if (typeof log !== 'string' || !log || log.includes('\0')) throw new Error('log or known session required');
-      const child = Bun.spawn([...(this.config.status ?? ['pi-status.sh']), log], { stdout: 'pipe', stderr: 'ignore' });
-      const output = await new Response(child.stdout).text();
-      if (await child.exited) throw new Error('status script failed');
-      const result = parseStatus(output);
+      const { code, stdout } = await capture([...(this.config.status ?? ['pi-status.sh']), log], this.config.scriptTimeoutMs);
+      if (code !== 0) throw new Error('status script failed');
+      const result = parseStatus(stdout);
       let finalState: string | null = null;
       try { finalState = readFileSync(`${log}.state`, 'utf8').trim() || null; } catch {}
       if (finalState) result.state = finalState;

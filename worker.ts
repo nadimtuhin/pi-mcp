@@ -1,6 +1,6 @@
 import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
 import { spawn } from 'node:child_process';
-import { parseStatus } from './service';
+import { capture, parseStatus } from './service';
 
 writeFileSync(`${process.argv[2]}.pid`, String(process.pid));
 const run = JSON.parse(readFileSync(process.argv[2], 'utf8'));
@@ -34,10 +34,9 @@ const retryAfter = outcome === 'quota' ? last(/retry[-_ ]?after\D{0,3}(\d+)/gi) 
 const resetAt = outcome === 'quota' ? last(/reset(?:s|_at)?\D{0,4}(\d{4}-\d\d-\d\dT[\d:.]+Z?)/gi) : undefined;
 let counters = { turns: 0, tool_calls: 0, retries: 0 };
 try {
-  const status = Bun.spawn([...run.status, run.log], { stdout: 'pipe', stderr: 'ignore' });
-  const output = await new Response(status.stdout).text();
-  if (await status.exited === 0) {
-    const data = parseStatus(output);
+  const { code, stdout } = await capture([...run.status, run.log]);
+  if (code === 0) {
+    const data = parseStatus(stdout);
     counters = { turns: data.turns, tool_calls: data.tools, retries: data.retries };
   }
 } catch {}
