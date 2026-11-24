@@ -1,7 +1,7 @@
 import { test, expect, afterEach } from 'bun:test';
 import { mkdirSync, rmSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { Service, alive } from './service';
+import { Service, alive, capture } from './service';
 import { Database } from 'bun:sqlite';
 
 const roots: string[] = [];
@@ -433,4 +433,43 @@ test('status log path is passed to the script as an absolute path, never as an o
   service.config.status = [`${root}/argv.sh`];
   await service.call('pi_status', { log: '--help' }).catch(() => {});
   expect(readFileSync(`${root}/argv`, 'utf8')).toBe(resolve('--help'));
+});
+
+test('status script whose grandchild holds stdout open still frees the pool slot on timeout', async () => {
+  const { root, service, http, args } = await startable();
+  service.config.durable = ['/usr/bin/true'];
+  service.config.scriptTimeoutMs = 300;
+  writeFileSync(`${root}/hold.sh`, `#!/bin/sh\nsleep 30 &\necho $! > "${root}/grandchild"\nexec sleep 30\n`, { mode: 0o700 });
+  service.config.status = [`${root}/hold.sh`];
+  let pid: number | undefined;
+  try {
+    pid = (await service.call('pi_start', args('held'))).pid;
+    await until(() => historyRows(root).length === 1);
+    await until(() => !running(pid!));
+    await until(async () => (await service.poolState('cx')).in_flight === 0);
+    await until(() => !running(Number(readFileSync(`${root}/grandchild`, 'utf8'))));
+  } finally { if (pid) { try { process.kill(-pid, 'SIGKILL'); } catch {} } http.stop(true); }
+});
+
+test('capture timeout kills the whole process group and does not wait on an inherited pipe', async () => {
+  const { root } = fixture();
+  writeFileSync(`${root}/hold.sh`, `#!/bin/sh\nsleep 30 &\necho $! > "${root}/grandchild"\nexec sleep 30\n`, { mode: 0o700 });
+  const started = Date.now();
+  expect(await capture([`${root}/hold.sh`], 300)).toEqual({ code: null, stdout: '' });
+  expect(Date.now() - started).toBeLessThan(3000);
+  await until(() => !running(Number(readFileSync(`${root}/grandchild`, 'utf8'))));
+});
+
+test('capture timeout releases its caller even when a grandchild escaped the process group with the pipe', async () => {
+  const { root } = fixture();
+  writeFileSync(`${root}/escape.sh`, `#!/bin/sh\nsetsid sleep 30 &\necho $! > "${root}/escaped"\nexec sleep 30\n`, { mode: 0o700 });
+  const caller = Bun.spawn([process.execPath, '-e', `const { capture } = await import(${JSON.stringify(resolve('service.ts'))}); await capture([${JSON.stringify(`${root}/escape.sh`)}], 300);`], { stdout: 'ignore', stderr: 'ignore' });
+  try {
+    const started = Date.now();
+    await until(async () => caller.exitCode !== null);
+    expect(Date.now() - started).toBeLessThan(3000);
+  } finally {
+    caller.kill('SIGKILL');
+    try { process.kill(Number(readFileSync(`${root}/escaped`, 'utf8')), 'SIGKILL'); } catch {}
+  }
 });

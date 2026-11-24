@@ -34,7 +34,7 @@ const retryAfter = outcome === 'quota' ? last(/retry[-_ ]?after\D{0,3}(\d+)/gi) 
 const resetAt = outcome === 'quota' ? last(/reset(?:s|_at)?\D{0,4}(\d{4}-\d\d-\d\dT[\d:.]+Z?)/gi) : undefined;
 let counters = { turns: 0, tool_calls: 0, retries: 0 };
 try {
-  const { code, stdout } = await capture([...run.status, run.log]);
+  const { code, stdout } = await capture([...run.status, run.log], run.scriptTimeoutMs);
   if (code === 0) {
     const data = parseStatus(stdout);
     counters = { turns: data.turns, tool_calls: data.tools, retries: data.retries };

@@ -49,7 +49,10 @@ const cases = [
   ['index.ts', 'pending.push(handle(line));', 'await handle(line);', 'a slow tool call'],
   ['index.ts', "Object.hasOwn(definitions, name) ? definitions[name] : undefined", 'definitions[name]', 'inherited from Object.prototype'],
   ['service.ts', 'return !await groupRunning(run.pid);', 'return false;', 'only members are zombies'],
-  ['service.ts', "child.kill('SIGKILL'); resolve(null); }, timeoutMs)", "child.kill('SIGKILL'); resolve(null); }, 1e9)", 'hanging'],
+  ['service.ts', "resolve('expired'), timeoutMs)", "resolve('expired'), 1e9)", 'hanging'],
+  ['service.ts', "detached: true, stdio: ['ignore', 'pipe', 'ignore']", "stdio: ['ignore', 'pipe', 'ignore']", 'capture timeout kills the whole process group'],
+  ['service.ts', '    stdout.destroy();\n', '', 'escaped the process group'],
+  ['worker.ts', 'run.log], run.scriptTimeoutMs)', 'run.log])', 'grandchild holds stdout open'],
   ['service.ts', "!args.log.includes('\\0') ? resolve(args.log) : args.log", "!args.log.includes('\\0') ? args.log : args.log", 'absolute path, never as an option'],
 ];
 let failed = 0;

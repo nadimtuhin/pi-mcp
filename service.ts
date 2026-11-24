@@ -42,16 +42,34 @@ export function summarize(rows: any[], now = Date.now()): any[] {
       cooldown_until: cooldown && cooldown > now ? cooldown : null };
   });
 }
-// Runs a helper script with a hard deadline. The child is SIGKILLed on expiry and the read is abandoned, so a
-// grandchild that keeps the pipe open cannot stall the caller either. code is null when the deadline passed.
-export async function capture(command: string[], timeoutMs = 30_000): Promise<{ code: number | null; stdout: string }> {
-  const child = Bun.spawn(command, { stdout: 'pipe', stderr: 'ignore' });
+// Runs a helper script with a hard deadline. The script runs in its own process group; on expiry the whole group
+// gets SIGTERM, then SIGKILL, and the pipe is destroyed, so a grandchild that inherited stdout can neither outlive
+// the deadline nor keep the caller's event loop (and with it a worker's pool slot) alive. code is null on timeout.
+export async function capture(command: string[], timeoutMs = 30_000, graceMs = 500): Promise<{ code: number | null; stdout: string }> {
+  const child = spawn(command[0], command.slice(1), { detached: true, stdio: ['ignore', 'pipe', 'ignore'] });
+  const stdout = child.stdout!;
+  const signalGroup = (signal: NodeJS.Signals) => { try { process.kill(-child.pid!, signal); } catch (error: any) { if (error.code !== 'ESRCH') throw error; } };
+  const chunks: Buffer[] = [];
+  stdout.on('data', chunk => chunks.push(chunk));
+  const ended = new Promise<void>(resolve => { stdout.once('close', resolve); });
+  const exited = new Promise<number | null>((resolve, reject) => {
+    child.once('error', reject);
+    child.once('exit', (code, signal) => resolve(signal ? null : code));
+  });
   let timer: ReturnType<typeof setTimeout> | undefined;
-  const expired = new Promise<null>(resolve => { timer = setTimeout(() => { child.kill('SIGKILL'); resolve(null); }, timeoutMs); });
+  const expired = new Promise<'expired'>(resolve => { timer = setTimeout(() => resolve('expired'), timeoutMs); });
   try {
-    const done = await Promise.race([Promise.all([new Response(child.stdout).text(), child.exited]), expired]);
-    return done ? { code: done[1], stdout: done[0] } : { code: null, stdout: '' };
-  } finally { clearTimeout(timer); }
+    const done = await Promise.race([Promise.all([exited, ended]), expired]);
+    if (done !== 'expired') return { code: done[0], stdout: Buffer.concat(chunks).toString('utf8') };
+    signalGroup('SIGTERM');
+    await Promise.race([Promise.all([exited, ended]).catch(() => {}), Bun.sleep(graceMs)]);
+    signalGroup('SIGKILL');
+    return { code: null, stdout: '' };
+  } finally {
+    clearTimeout(timer);
+    stdout.destroy();
+    child.unref();
+  }
 }
 // True while the process group has a member that is not a zombie. Orphans reparented to a slow-reaping init
 // (common in containers) stay visible to kill(-pgid, 0) as zombies after everything has exited.
@@ -260,12 +278,12 @@ export class Service {
         const log = resolve(this.config.root, `${args.session}.${attempt}.log`);
         const descriptor = resolve(this.config.root, `${args.session}.${attempt}.json`);
         const run = { ...args, root: resolve(this.config.root), worktree: resolve(String(args.worktree)), brief_path: resolve(String(args.brief_path)), log, attempt, descriptor,
-          status: this.config.status ?? ['pi-status.sh'], durable: this.config.durable ?? ['durable-pi.sh'], policy: this.config.policy, concurrency: state.in_flight + 1 };
+          status: this.config.status ?? ['pi-status.sh'], durable: this.config.durable ?? ['durable-pi.sh'], policy: this.config.policy, scriptTimeoutMs: this.config.scriptTimeoutMs, concurrency: state.in_flight + 1 };
         const others = this.runs().filter(row => row.session !== args.session);
         writeFileSync(descriptor, JSON.stringify(run), { mode: 0o600 });
         this.saveRuns([...others, { ...run, pid: null, launching: true, launched_at: Date.now() }]);
         const output = openSync(log, 'a', 0o600);
-        let child;
+        let child: ReturnType<typeof spawn>;
         try {
           child = spawn(process.execPath, [resolve(import.meta.dir, 'worker.ts'), descriptor], { detached: true, stdio: ['ignore', output, output] });
           await new Promise<void>((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject); });
